@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"io"
 	"regexp"
-	"time"
 
 	"github.com/cockroachdb/cockroach/util/syncutil"
 	"github.com/gogo/protobuf/proto"
@@ -51,6 +50,23 @@ func NewRegistry() *Registry {
 	return &Registry{
 		tracked: map[string]Iterable{},
 	}
+}
+
+// AddMetric adds the passed-in metric to the registry.
+func (r *Registry) AddMetric(metric Iterable) {
+	r.Lock()
+	defer r.Unlock()
+	r.tracked[metric.GetName()] = metric
+}
+
+// AddMetricGroup expands the metric group and adds all of them
+// as individual metrics to the registry.
+func (r *Registry) AddMetricGroup(group metricGroup) {
+	r.Lock()
+	defer r.Unlock()
+	group.iterate(func(metric Iterable) {
+		r.tracked[metric.GetName()] = metric
+	})
 }
 
 // Add links the given Iterable into this registry using the given format
@@ -131,39 +147,6 @@ func (r *Registry) PrintAsText(w io.Writer) error {
 	return ret
 }
 
-// Histogram registers a new windowed HDRHistogram with the given parameters.
-// Data is kept in the active window for approximately the given duration.
-func (r *Registry) Histogram(name string, duration time.Duration, maxVal int64,
-	sigFigs int) *Histogram {
-	h := NewHistogram(duration, maxVal, sigFigs)
-	r.MustAdd(name, h)
-	return h
-}
-
-// Latency is a convenience function which registers histograms with
-// suitable defaults for latency tracking. Values are expressed in ns,
-// are truncated into the interval [0, time.Minute] and are recorded
-// with two digits of precision (i.e. errors of <1ms at 100ms, <.6s at 1m).
-// The generated names of the metric will begin with the given prefix.
-//
-// TODO(mrtracy,tschottdorf): need to discuss roll-ups and generally how (and
-// which) information flows between metrics and time series.
-func (r *Registry) Latency(prefix string) Histograms {
-	windows := DefaultTimeScales
-	hs := make(Histograms)
-	for _, w := range windows {
-		hs[w] = r.Histogram(prefix+sep+w.name, w.d, int64(time.Minute), 2)
-	}
-	return hs
-}
-
-// Counter registers new counter to the registry.
-func (r *Registry) Counter(name string) *Counter {
-	c := NewCounter()
-	r.MustAdd(name, c)
-	return c
-}
-
 // GetCounter returns the Counter in this registry with the given name. If a
 // Counter with this name is not present (including if a non-Counter Iterable is
 // registered with the name), nil is returned.
@@ -179,13 +162,6 @@ func (r *Registry) GetCounter(name string) *Counter {
 		return nil
 	}
 	return counter
-}
-
-// Gauge registers a new Gauge with the given name.
-func (r *Registry) Gauge(name string) *Gauge {
-	g := NewGauge()
-	r.MustAdd(name, g)
-	return g
 }
 
 // GetGauge returns the Gauge in this registry with the given name. If a Gauge
@@ -205,21 +181,6 @@ func (r *Registry) GetGauge(name string) *Gauge {
 	return gauge
 }
 
-// GaugeFloat64 registers a new GaugeFloat64 with the given name.
-func (r *Registry) GaugeFloat64(name string) *GaugeFloat64 {
-	g := NewGaugeFloat64()
-	r.MustAdd(name, g)
-	return g
-}
-
-// Rate creates an EWMA rate over the given timescale. The comments on NewRate
-// apply.
-func (r *Registry) Rate(name string, timescale time.Duration) *Rate {
-	e := NewRate(timescale)
-	r.MustAdd(name, e)
-	return e
-}
-
 // GetRate returns the Rate in this registry with the given name. If a Rate with
 // this name is not present (including if a non-Rate Iterable is registered with
 // the name), nil is returned.
@@ -235,16 +196,4 @@ func (r *Registry) GetRate(name string) *Rate {
 		return nil
 	}
 	return rate
-}
-
-// Rates registers and returns a new Rates instance, which contains a set of EWMA-based rates
-// with generally useful time scales and a cumulative counter.
-func (r *Registry) Rates(prefix string) Rates {
-	scales := DefaultTimeScales
-	es := make(map[TimeScale]*Rate)
-	for _, scale := range scales {
-		es[scale] = r.Rate(prefix+sep+scale.name, scale.d)
-	}
-	c := r.Counter(prefix + sep + "count")
-	return Rates{Counter: c, Rates: es}
 }

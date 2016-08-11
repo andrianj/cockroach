@@ -57,15 +57,34 @@ var (
 
 // Iterable provides a method for synchronized access to interior objects.
 type Iterable interface {
+	// Name returns the fully-qualified name of the metric.
+	GetName() string
+	// Help returns the help text for the metric.
+	GetHelp() string
 	// Each calls the given closure with each contained item.
 	Each(func(string, interface{}))
 }
 
-// PrometheusExportable provides a method to fill in a prometheus object.
+// PrometheusExportable is the standard interface for an individual metric
+// that can be exported to prometheus.
 type PrometheusExportable interface {
 	// FillPrometheusMetric takes an initialized prometheus metric object and
 	// fills the appropriate fields for the metric type.
 	FillPrometheusMetric(promMetric *prometheusgo.MetricFamily)
+}
+
+// MetricMetadata holds metadata about a metric. It must be embedded in
+// each metric object.
+type MetricMetadata struct {
+	Name, Help string
+}
+
+func (m *MetricMetadata) GetName() string {
+	return m.Name
+}
+
+func (m *MetricMetadata) GetHelp() string {
+	return m.Help
 }
 
 var _ Iterable = &Gauge{}
@@ -114,6 +133,7 @@ func maybeTick(m periodic) {
 
 // A Histogram is a wrapper around an hdrhistogram.WindowedHistogram.
 type Histogram struct {
+	MetricMetadata
 	maxVal int64
 
 	mu       syncutil.Mutex
@@ -125,14 +145,15 @@ type Histogram struct {
 // NewHistogram creates a new windowed HDRHistogram with the given parameters.
 // Data is kept in the active window for approximately the given duration.
 // See the documentation for hdrhistogram.WindowedHistogram for details.
-func NewHistogram(duration time.Duration, maxVal int64, sigFigs int) *Histogram {
-	h := &Histogram{}
-	h.maxVal = maxVal
-	h.nextT = now()
-	h.duration = duration
-
-	h.windowed = hdrhistogram.NewWindowed(histWrapNum, 0, h.maxVal, sigFigs)
-	return h
+func NewHistogram(metadata MetricMetadata, duration time.Duration,
+	maxVal int64, sigFigs int) *Histogram {
+	return &Histogram{
+		MetricMetadata: metadata,
+		maxVal:         maxVal,
+		nextT:          now(),
+		duration:       duration,
+		windowed:       hdrhistogram.NewWindowed(histWrapNum, 0, maxVal, sigFigs),
+	}
 }
 
 func (h *Histogram) tick() {
@@ -182,16 +203,6 @@ func (h *Histogram) Each(f func(string, interface{})) {
 	f("", h)
 }
 
-// Histograms is a map of Histogram metrics.
-type Histograms map[TimeScale]*Histogram
-
-// RecordValue calls through to each individual Histogram.
-func (hs Histograms) RecordValue(v int64) {
-	for _, h := range hs {
-		h.RecordValue(v)
-	}
-}
-
 // FillPrometheusMetric fills the appropriate metric fields.
 func (h *Histogram) FillPrometheusMetric(promMetric *prometheusgo.MetricFamily) {
 	// TODO(mjibson): change to a Histogram once bucket counts are reasonable
@@ -217,12 +228,13 @@ func (h *Histogram) FillPrometheusMetric(promMetric *prometheusgo.MetricFamily) 
 
 // A Counter holds a single mutable atomic value.
 type Counter struct {
+	MetricMetadata
 	metrics.Counter
 }
 
 // NewCounter creates a counter.
-func NewCounter() *Counter {
-	return &Counter{metrics.NewCounter()}
+func NewCounter(metadata MetricMetadata) *Counter {
+	return &Counter{metadata, metrics.NewCounter()}
 }
 
 // Each calls the given closure with the empty string and itself.
@@ -243,13 +255,13 @@ func (c *Counter) FillPrometheusMetric(promMetric *prometheusgo.MetricFamily) {
 
 // A Gauge atomically stores a single integer value.
 type Gauge struct {
+	MetricMetadata
 	metrics.Gauge
 }
 
 // NewGauge creates a Gauge.
-func NewGauge() *Gauge {
-	g := &Gauge{metrics.NewGauge()}
-	return g
+func NewGauge(metadata MetricMetadata) *Gauge {
+	return &Gauge{metadata, metrics.NewGauge()}
 }
 
 // Each calls the given closure with the empty string and itself.
@@ -270,13 +282,13 @@ func (g *Gauge) FillPrometheusMetric(promMetric *prometheusgo.MetricFamily) {
 
 // A GaugeFloat64 atomically stores a single float64 value.
 type GaugeFloat64 struct {
+	MetricMetadata
 	metrics.GaugeFloat64
 }
 
 // NewGaugeFloat64 creates a GaugeFloat64.
-func NewGaugeFloat64() *GaugeFloat64 {
-	g := &GaugeFloat64{metrics.NewGaugeFloat64()}
-	return g
+func NewGaugeFloat64(metadata MetricMetadata) *GaugeFloat64 {
+	return &GaugeFloat64{metadata, metrics.NewGaugeFloat64()}
 }
 
 // Each calls the given closure with the empty string and itself.
@@ -297,6 +309,7 @@ func (g *GaugeFloat64) FillPrometheusMetric(promMetric *prometheusgo.MetricFamil
 
 // A Rate is a exponential weighted moving average.
 type Rate struct {
+	MetricMetadata
 	mu       syncutil.Mutex // protects fields below
 	curSum   float64
 	wrapped  ewma.MovingAverage
@@ -306,7 +319,7 @@ type Rate struct {
 
 // NewRate creates an EWMA rate on the given timescale. Timescales at
 // or below 2s are illegal and will cause a panic.
-func NewRate(timescale time.Duration) *Rate {
+func NewRate(metadata MetricMetadata, timescale time.Duration) *Rate {
 	const tickInterval = time.Second
 	if timescale <= 2*time.Second {
 		panic(fmt.Sprintf("EWMA with per-second ticks makes no sense on timescale %s", timescale))
@@ -314,9 +327,10 @@ func NewRate(timescale time.Duration) *Rate {
 	avgAge := float64(timescale) / float64(2*tickInterval)
 
 	return &Rate{
-		interval: tickInterval,
-		nextT:    now(),
-		wrapped:  ewma.NewMovingAverage(avgAge),
+		MetricMetadata: metadata,
+		interval:       tickInterval,
+		nextT:          now(),
+		wrapped:        ewma.NewMovingAverage(avgAge),
 	}
 }
 
@@ -364,18 +378,4 @@ func (e *Rate) MarshalJSON() ([]byte, error) {
 	defer e.mu.Unlock()
 	maybeTick(e)
 	return json.Marshal(e.wrapped.Value())
-}
-
-// Rates is a counter and associated EWMA backed rates at different time scales.
-type Rates struct {
-	*Counter
-	Rates map[TimeScale]*Rate
-}
-
-// Add adds the given value to all contained objects.
-func (es Rates) Add(v int64) {
-	es.Counter.Inc(v)
-	for _, e := range es.Rates {
-		e.Add(float64(v))
-	}
 }
